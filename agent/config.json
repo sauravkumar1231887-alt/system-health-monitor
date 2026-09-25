@@ -1,0 +1,6 @@
+{
+  "serverUrl": "https://monitoring.example.com",
+  "apiKey": "replace-with-device-token",
+  "intervalSeconds": 30,
+  "requiredDestinations": [{ "name": "Monitoring Server", "host": "monitoring.example.com", "port": 443 }]
+}

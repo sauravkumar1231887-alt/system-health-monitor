@@ -1,0 +1,1 @@
+"""Shared Django backend infrastructure."""

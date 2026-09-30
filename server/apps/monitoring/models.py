@@ -1,0 +1,1 @@
+"""Monitoring settings and audit records use the existing MongoDB collections."""

@@ -1,0 +1,1 @@
+"""Reports are generated from monitoring records; no SQL models are used."""

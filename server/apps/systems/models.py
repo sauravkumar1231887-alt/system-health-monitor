@@ -1,0 +1,1 @@
+"""System and metric records are accessed from the existing MongoDB collections."""

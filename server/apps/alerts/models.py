@@ -1,0 +1,1 @@
+"""Alert records are accessed from the existing MongoDB collection."""

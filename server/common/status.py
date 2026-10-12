@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 
-DEFAULT_SETTINGS = {"heartbeatIntervalSeconds": 30, "offlineThresholdSeconds": 90, "cpuWarning": 80, "cpuCritical": 90, "ramWarning": 80, "ramCritical": 90, "diskWarning": 80, "diskCritical": 90, "allowedPorts": [80, 443, 3389]}
+DEFAULT_SETTINGS = {"heartbeatIntervalSeconds": 30, "staleThresholdSeconds": 90, "offlineThresholdSeconds": 300, "cpuWarning": 80, "cpuCritical": 90, "ramWarning": 80, "ramCritical": 90, "diskWarning": 80, "diskCritical": 90, "allowedPorts": [80, 443, 3389]}
 
 
 def _port_number(value):
@@ -21,8 +21,12 @@ def system_status(system, settings=DEFAULT_SETTINGS, now=None):
             heartbeat = None
     if heartbeat and heartbeat.tzinfo is None:
         heartbeat = heartbeat.replace(tzinfo=timezone.utc)
-    if not heartbeat or (now - heartbeat).total_seconds() > settings.get("offlineThresholdSeconds", 90):
+    if not heartbeat:
         return "offline"
+    age_seconds = (now - heartbeat).total_seconds()
+    if age_seconds > 300:
+        return "offline"
+    stale = age_seconds > 90
     antivirus = system.get("antivirus") or {}
     firewall = system.get("firewall") or {}
     network = system.get("network") or {}
@@ -35,6 +39,6 @@ def system_status(system, settings=DEFAULT_SETTINGS, now=None):
             for key, threshold, fallback in (("cpuPercent", "cpuWarning", 80), ("memoryPercent", "ramWarning", 80), ("diskPercent", "diskWarning", 80)))
             or antivirus.get("updated") is False
             or network.get("status") == "WARNING"
-            or any(_port_number(port.get("port")) not in settings.get("allowedPorts", []) for port in system.get("listeningPorts", []))):
+            or any(_port_number(port.get("port")) not in settings.get("allowedPorts", []) for port in (system.get("listeningPorts") or []))):
         return "warning"
-    return "online"
+    return "stale" if stale else "online"

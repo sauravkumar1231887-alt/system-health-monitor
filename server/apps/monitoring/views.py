@@ -17,39 +17,96 @@ logger = logging.getLogger("monitoring.settings")
 
 
 def _live_record(system):
-    has_agent_sample = bool(system.get("liveMonitoringAt"))
+    has_agent_sample = bool(system.get("liveMonitoringAt") or (system.get("lastHeartbeat") and not settings.DEMO_MODE))
+    heartbeat_status = _heartbeat_status(system.get("lastHeartbeat"))
     system_status = system.get("status", "offline")
     if settings.DEMO_MODE and not has_agent_sample:
         system_status = "offline"
-    is_current = has_agent_sample and system_status != "offline"
+    is_current = has_agent_sample and heartbeat_status != "OFFLINE"
     last_known = None
     if has_agent_sample:
+        health = system.get("systemHealth") or {}
+        health.setdefault("cpuPercent", system.get("cpuPercent"))
+        health.setdefault("memoryPercent", system.get("memoryPercent"))
+        health.setdefault("diskPercent", system.get("diskPercent"))
+        health.setdefault("diskFreeBytes", system.get("diskFreeBytes"))
+        health.setdefault("uptimeSeconds", system.get("uptimeSeconds"))
+        if not health.get("memory") and any(system.get(key) is not None for key in ("totalMemoryBytes", "usedMemoryBytes", "freeMemoryBytes")):
+            health["memory"] = {"totalBytes": system.get("totalMemoryBytes"), "usedBytes": system.get("usedMemoryBytes"), "freeBytes": system.get("freeMemoryBytes"), "usagePercent": system.get("memoryPercent")}
+        disk = health.get("disk") or {}
+        if not disk.get("volumes") and system.get("diskFreeBytes") is not None:
+            disk["volumes"] = [{"drive": None, "freeBytes": system.get("diskFreeBytes"), "usagePercent": system.get("diskPercent")}]
+        if disk:
+            health["disk"] = disk
+        operating_system = health.get("operatingSystem") or {}
+        for key, value in {
+            "caption": system.get("os"),
+            "name": system.get("os"),
+            "version": system.get("osVersion"),
+            "buildNumber": system.get("osBuildNumber"),
+            "architecture": system.get("osArchitecture"),
+            "uptimeSeconds": system.get("uptimeSeconds"),
+            "lastBootTime": system.get("lastBootTime"),
+            "agentVersion": system.get("agentVersion"),
+            "ip": system.get("ipAddress") or system.get("ip"),
+        }.items():
+            if value is not None:
+                operating_system.setdefault(key, value)
+        if operating_system:
+            health["operatingSystem"] = operating_system
+        security = health.get("security") or {}
+        antivirus = system.get("antivirus") or security.get("antivirus") or {}
+        if antivirus:
+            antivirus = dict(antivirus)
+            antivirus.setdefault("product", antivirus.get("name") or "Unknown")
+            antivirus.setdefault("name", antivirus.get("product") or "Unknown")
+            if "updated" not in antivirus:
+                antivirus["updated"] = antivirus.get("definitionsUpToDate")
+            if "definitionsUpToDate" not in antivirus:
+                antivirus["definitionsUpToDate"] = antivirus.get("updated")
+            security["antivirus"] = antivirus
+        firewall = system.get("firewall") or security.get("firewall")
+        if firewall:
+            security["firewall"] = firewall
+        if security:
+            health["security"] = security
+        network = dict(system.get("network") or {})
+        if network.get("latencyMs") is not None:
+            network.setdefault("latency", {}).setdefault("reportedMs", network["latencyMs"])
         last_known = {
-            "systemHealth": system.get("systemHealth") or {
-                "cpuPercent": system.get("cpuPercent"),
-                "memoryPercent": system.get("memoryPercent"),
-                "diskPercent": system.get("diskPercent"),
-                "totalMemoryBytes": system.get("totalMemoryBytes"),
-                "usedMemoryBytes": system.get("usedMemoryBytes"),
-                "freeMemoryBytes": system.get("freeMemoryBytes"),
-                "diskFreeBytes": system.get("diskFreeBytes"),
-                "uptimeSeconds": system.get("uptimeSeconds"),
-            },
+            "systemHealth": health,
             "ups": system.get("ups"),
-            "network": system.get("network"),
+            "network": network,
         }
     return {
         "_id": system.get("_id"),
         "hostname": system.get("hostname"),
-        "ip": system.get("ip"),
-        "os": system.get("os"),
+        "ip": system.get("ipAddress") or system.get("ip") or (last_known or {}).get("systemHealth", {}).get("operatingSystem", {}).get("ip"),
+        "ipAddress": system.get("ipAddress") or system.get("ip") or (last_known or {}).get("systemHealth", {}).get("operatingSystem", {}).get("ip"),
+        "os": system.get("os") or (last_known or {}).get("systemHealth", {}).get("operatingSystem", {}).get("caption") or (last_known or {}).get("systemHealth", {}).get("operatingSystem", {}).get("name"),
+        "agentVersion": system.get("agentVersion") or (last_known or {}).get("systemHealth", {}).get("operatingSystem", {}).get("agentVersion"),
         "status": system_status,
+        "heartbeatStatus": heartbeat_status,
         "lastHeartbeat": system.get("lastHeartbeat") if has_agent_sample else None,
-        "lastUpdated": system.get("liveMonitoringAt"),
+        "lastUpdated": system.get("liveMonitoringAt") or system.get("lastHeartbeat"),
         "isCurrent": is_current,
         "current": last_known if is_current else None,
         "lastKnown": last_known,
     }
+
+
+def _heartbeat_status(value):
+    if not value:
+        return "OFFLINE"
+    timestamp = _as_utc(value)
+    age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+    return "OFFLINE" if age > 300 else "STALE" if age > 90 else "ONLINE"
+
+
+def _as_utc(value):
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 def _period_range(period):
@@ -94,6 +151,7 @@ class LiveMonitoringView(APIView):
                 "summary": {
                     "total": len(records),
                     "online": online,
+                        "stale": sum(record["heartbeatStatus"] == "STALE" for record in records),
                     "warning": sum(record["status"] == "warning" for record in records),
                     "critical": sum(record["status"] == "critical" for record in records),
                     "offline": sum(record["status"] == "offline" for record in records),
@@ -161,7 +219,7 @@ class SystemUpsView(SystemTelemetrySliceView):
 
 class SystemHistoryView(APIView):
     def get(self, request, system_id):
-        period = request.query_params.get("period", "24h")
+        period = request.query_params.get("range") or request.query_params.get("period", "24h")
         date_range = _period_range(period)
         if not date_range:
             return Response({"message": "Period must be 1h, 6h, 24h, 7d, or 30d"}, status=status.HTTP_400_BAD_REQUEST)
@@ -170,7 +228,8 @@ class SystemHistoryView(APIView):
                 return Response({"message": "System not found"}, status=404)
             start, end, bucket_seconds = date_range
             metrics = get_history(system_id, start, end, bucket_seconds)
-            return Response({"period": period, "metrics": metrics})
+            serialized_metrics = json_value(metrics)
+            return Response({"systemId": system_id, "range": period, "samples": serialized_metrics, "period": period, "metrics": serialized_metrics})
         except Exception as error:
             log_failure(logger, "System history query failed", error)
             return Response({"message": "Unable to load system history"}, status=503)

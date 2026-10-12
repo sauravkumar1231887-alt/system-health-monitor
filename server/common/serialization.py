@@ -1,10 +1,12 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from bson import ObjectId
 
 
 def json_value(value):
     if isinstance(value, (datetime, date)):
+        if isinstance(value, datetime) and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return value.isoformat().replace("+00:00", "Z")
     if isinstance(value, ObjectId):
         return str(value)

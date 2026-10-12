@@ -52,6 +52,39 @@ class SystemApiTests(SimpleTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data, {"message": "Invalid heartbeat payload"})
 
+    def test_platform_field_is_preserved_for_multi_platform_agents(self):
+        agent = APIClient()
+        agent.credentials(HTTP_X_AGENT_KEY="demo-agent-pc-001")
+        payload = {
+            "hostname": "LINUX-01",
+            "platform": "linux",
+            "ipAddress": "192.168.8.50",
+            "os": "Ubuntu 24.04 LTS",
+            "agentVersion": "2.0.0",
+            "cpu": {"usagePercent": 42.5},
+            "memory": {"usedPercent": 58.8},
+            "disks": [{"mount": "/", "usedPercent": 61.0}],
+            "uptime": {"seconds": 3600},
+            "network": {"connected": True, "status": "HEALTHY"},
+            "firewall": {"name": "ufw", "enabled": True, "status": "enabled"},
+            "security": {"name": "Not detected", "status": "UNKNOWN"},
+            "listeningPorts": [{"port": 443, "protocol": "TCP", "state": "LISTENING"}],
+            "systemHealth": {"status": "HEALTHY"},
+            "heartbeat": {"collectedAt": "2026-09-29T12:00:00Z"},
+        }
+        response = agent.post("/api/heartbeat", payload, format="json")
+        self.assertEqual(response.status_code, 202)
+        detail = self.client.get("/api/systems/pc-001").data
+        self.assertEqual(detail["platform"], "linux")
+        self.assertEqual(detail["os"], "Ubuntu 24.04 LTS")
+
+    def test_platform_summary_endpoint_uses_real_system_counts(self):
+        response = self.client.get("/api/platform-summary")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["windows"]["total"], 4)
+        self.assertEqual(response.data["linux"]["total"], 0)
+        self.assertEqual(response.data["macos"]["total"], 0)
+
     def test_browser_get_to_heartbeat_returns_json_method_error(self):
         agent = APIClient()
         agent.credentials(HTTP_X_AGENT_KEY="demo-agent-pc-001")
@@ -80,6 +113,30 @@ class SystemApiTests(SimpleTestCase):
         self.assertEqual(detail["network"]["gateway"], "10.20.4.1")
         self.assertTrue(detail["firewall"]["public"])
         self.assertEqual(detail["listeningPorts"][0]["port"], 443)
+
+    def test_live_response_normalizes_agent_ip_os_memory_disk_and_antivirus(self):
+        agent = APIClient()
+        agent.credentials(HTTP_X_AGENT_KEY="demo-agent-pc-001")
+        payload = {
+            "hostname": "ENG-WS-014",
+            "ipAddress": "10.20.4.14",
+            "agentVersion": "1.6.0",
+            "systemHealth": {
+                "operatingSystem": {"caption": "Windows Pro", "version": "10.0.1", "buildNumber": "26100", "architecture": "64-bit"},
+                "memory": {"totalBytes": 1600, "usedBytes": 1000, "freeBytes": 600, "usagePercent": 62.5},
+                "disk": {"volumes": [{"drive": "C:", "totalBytes": 1000, "usedBytes": 400, "freeBytes": 600, "usagePercent": 40}]},
+                "security": {"antivirus": {"name": "Microsoft Defender", "enabled": True, "definitionsUpToDate": True}},
+            },
+        }
+        self.assertEqual(agent.post("/api/heartbeat", payload, format="json").status_code, 202)
+        live = self.client.get("/api/systems/pc-001/live").data
+        self.assertEqual(live["ipAddress"], "10.20.4.14")
+        self.assertEqual(live["os"], "Windows Pro")
+        health = live["current"]["systemHealth"]
+        self.assertEqual(health["operatingSystem"]["buildNumber"], "26100")
+        self.assertEqual(health["memory"]["usedBytes"], 1000)
+        self.assertEqual(health["disk"]["volumes"][0]["drive"], "C:")
+        self.assertEqual(health["security"]["antivirus"]["product"], "Microsoft Defender")
 
     def test_live_telemetry_routes_and_history(self):
         agent = APIClient()
@@ -114,6 +171,12 @@ class SystemApiTests(SimpleTestCase):
         self.assertEqual(history["period"], "1h")
         self.assertEqual(history["metrics"][0]["downloadBytesPerSecond"], 4096)
 
+        for history_range in ("1h", "6h", "24h", "7d", "30d"):
+            ranged_history = self.client.get(f"/api/systems/pc-001/history?range={history_range}").data
+            self.assertEqual(ranged_history["range"], history_range)
+            self.assertEqual(ranged_history["samples"], ranged_history["metrics"])
+            self.assertTrue(ranged_history["samples"][0]["timestamp"].endswith("Z"))
+
     def test_live_api_does_not_present_fixture_values_as_agent_data(self):
         live = self.client.get("/api/live-monitoring").data
         system = next(item for item in live["systems"] if item["_id"] == "pc-001")
@@ -124,7 +187,7 @@ class SystemApiTests(SimpleTestCase):
         self.assertEqual(live["summary"]["online"], 0)
         self.assertEqual(live["summary"]["offline"], 4)
 
-    def test_offline_live_response_hides_current_but_preserves_last_known(self):
+    def test_stale_live_response_preserves_current_and_last_known(self):
         agent = APIClient()
         agent.credentials(HTTP_X_AGENT_KEY="demo-agent-pc-001")
         agent.post("/api/heartbeat", {
@@ -135,8 +198,9 @@ class SystemApiTests(SimpleTestCase):
         }, format="json")
         fixtures._DEMO["systems"][0]["lastHeartbeat"] = datetime.now(timezone.utc) - timedelta(seconds=120)
         response = self.client.get("/api/systems/pc-001/live")
-        self.assertFalse(response.data["isCurrent"])
-        self.assertIsNone(response.data["current"])
+        self.assertTrue(response.data["isCurrent"])
+        self.assertEqual(response.data["heartbeatStatus"], "STALE")
+        self.assertIsNotNone(response.data["current"])
         self.assertEqual(response.data["lastKnown"]["network"]["status"], "WARNING")
 
     def test_invalid_nested_measurement_and_history_period_are_rejected(self):
@@ -159,9 +223,13 @@ class SystemApiTests(SimpleTestCase):
     def test_status_preserves_critical_and_offline_thresholds(self):
         system = {"lastHeartbeat": "2026-09-26T11:58:00Z", "antivirus": {"enabled": True, "updated": True}, "firewall": {"domain": True, "private": True, "public": True}, "cpuPercent": 90}
         now = datetime.fromisoformat("2026-09-26T12:00:00+00:00")
-        self.assertEqual(system_status(system, now=now), "offline")
+        self.assertEqual(system_status(system, now=now), "critical")
         system["lastHeartbeat"] = "2026-09-26T11:59:30Z"
         self.assertEqual(system_status(system, now=now), "critical")
+        system["lastHeartbeat"] = "2026-09-26T11:54:59Z"
+        self.assertEqual(system_status(system, now=now), "offline")
+        system.update({"lastHeartbeat": "2026-09-26T11:58:29Z", "cpuPercent": 20})
+        self.assertEqual(system_status(system, now=now), "stale")
 
     def test_measured_network_health_affects_system_severity(self):
         system = {"lastHeartbeat": "2026-09-26T11:59:30Z", "network": {"status": "WARNING"}}

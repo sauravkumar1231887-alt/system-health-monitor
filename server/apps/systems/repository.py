@@ -78,12 +78,14 @@ def update_heartbeat(system, payload):
                 item["status"] = system["status"]
                 break
         _append_demo_metric(system, payload, now)
+        logger.info("Heartbeat stored system_id=%s hostname=%s received_fields=%s stored_fields=%s history_sample_id=%s timestamp=%s", system["_id"], system.get("hostname"), ",".join(sorted(key for key, value in payload.items() if value is not None)), ",".join(sorted(updated)), "in-memory", now.isoformat())
         return system
     collection("systems").update_one({"_id": _mongo_id(system["_id"])}, {"$set": updated})
     metric = _metric_document(system, payload, now)
     metric["systemId"] = _mongo_id(system["_id"])
     metric["expiresAt"] = now + timedelta(days=30)
-    collection("systemmetrics").insert_one(metric)
+    inserted = collection("systemmetrics").insert_one(metric)
+    logger.info("Heartbeat stored system_id=%s hostname=%s received_fields=%s stored_fields=%s history_sample_id=%s timestamp=%s", system["_id"], system.get("hostname"), ",".join(sorted(key for key, value in payload.items() if value is not None)), ",".join(sorted(updated)), inserted.inserted_id, now.isoformat())
     return system
 
 
@@ -108,6 +110,7 @@ def _metric_document(system, payload, timestamp):
         "uploadBytesPerSecond": traffic.get("uploadBytesPerSecond"),
         "downloadBytesPerSecond": traffic.get("downloadBytesPerSecond"),
         "upsBatteryPercent": battery if isinstance(battery, (int, float)) else None,
+        "status": system.get("status"),
         "systemHealth": payload.get("systemHealth"),
         "network": payload.get("network"),
         "ups": payload.get("ups"),
@@ -124,7 +127,7 @@ def get_metrics(system_id, limit=200, start=None, end=None):
     if settings.DEMO_MODE:
         metrics = demo_collection("systemmetrics")
     else:
-        query = {"systemId": _mongo_id(system_id)}
+        query = {"systemId": {"$in": _mongo_ids(system_id)}}
         if start or end:
             query["timestamp"] = {}
             if start:
@@ -152,7 +155,8 @@ def get_history(system_id, start, end, bucket_seconds):
 
     bucket_milliseconds = bucket_seconds * 1000
     pipeline = [
-        {"$match": {"systemId": _mongo_id(system_id), "timestamp": {"$gte": start, "$lte": end}}},
+        {"$match": {"systemId": {"$in": _mongo_ids(system_id)}, "timestamp": {"$gte": start, "$lte": end}}},
+        {"$sort": {"timestamp": 1}},
         {"$group": {
             "_id": {"$floor": {"$divide": [{"$toLong": "$timestamp"}, bucket_milliseconds]}},
             "cpuPercent": {"$avg": "$cpuPercent"},
@@ -161,10 +165,11 @@ def get_history(system_id, start, end, bucket_seconds):
             "uploadBytesPerSecond": {"$avg": "$uploadBytesPerSecond"},
             "downloadBytesPerSecond": {"$avg": "$downloadBytesPerSecond"},
             "upsBatteryPercent": {"$avg": "$upsBatteryPercent"},
+            "status": {"$last": "$status"},
         }},
-        {"$project": {"timestamp": {"$toDate": {"$multiply": ["$_id", bucket_milliseconds]}},
+        {"$project": {"_id": 0, "timestamp": {"$toDate": {"$multiply": ["$_id", bucket_milliseconds]}},
             "cpuPercent": 1, "memoryPercent": 1, "diskPercent": 1,
-            "uploadBytesPerSecond": 1, "downloadBytesPerSecond": 1, "upsBatteryPercent": 1}},
+            "uploadBytesPerSecond": 1, "downloadBytesPerSecond": 1, "upsBatteryPercent": 1, "status": 1}},
         {"$sort": {"timestamp": 1}},
     ]
     return [json_value(item) for item in collection("systemmetrics").aggregate(pipeline)]
@@ -175,7 +180,14 @@ def _average_metrics(bucket, items):
     for key in ("cpuPercent", "memoryPercent", "diskPercent", "uploadBytesPerSecond", "downloadBytesPerSecond", "upsBatteryPercent"):
         values = [item[key] for item in items if isinstance(item.get(key), (int, float))]
         result[key] = sum(values) / len(values) if values else None
+    latest = max(items, key=lambda item: _as_datetime(item.get("timestamp")))
+    result["status"] = latest.get("status")
     return result
+
+
+def _mongo_ids(system_id):
+    identifier = _mongo_id(system_id)
+    return [identifier, str(identifier)] if isinstance(identifier, ObjectId) else [identifier]
 
 
 def _as_datetime(value):

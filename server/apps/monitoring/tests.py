@@ -14,7 +14,7 @@ class OfflineMonitorTests(SimpleTestCase):
     def test_offline_transition_emits_one_alert(self):
         system = _DEMO["systems"][0]
         system["status"] = "online"
-        system["lastHeartbeat"] = datetime.now(timezone.utc) - timedelta(seconds=91)
+        system["lastHeartbeat"] = datetime.now(timezone.utc) - timedelta(seconds=301)
         before = len(_DEMO["alerts"])
         run_check()
         self.assertEqual(system["status"], "offline")

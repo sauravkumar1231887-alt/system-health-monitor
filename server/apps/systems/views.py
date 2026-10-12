@@ -18,12 +18,14 @@ from apps.systems.repository import get_metrics, get_settings, get_system, inser
 
 
 logger = logging.getLogger("monitoring.heartbeat")
+ALLOWED_PLATFORMS = {"windows", "linux", "macos"}
 HEARTBEAT_FIELDS = {
-    "hostname": "string", "ip": "string", "mac": "string", "os": "string", "osVersion": "string",
-    "manufacturer": "string", "model": "string", "cpuPercent": "percent", "memoryPercent": "percent",
-    "totalMemoryBytes": "number", "usedMemoryBytes": "number", "freeMemoryBytes": "number", "diskPercent": "percent",
-    "diskFreeBytes": "number", "uptimeSeconds": "number", "lastBootTime": "date", "antivirus": "object",
-    "firewall": "object", "network": "object", "systemHealth": "object", "ups": "object",
+    "hostname": "string", "platform": "string", "ip": "string", "ipAddress": "string", "mac": "string", "os": "string", "osVersion": "string",
+    "osBuildNumber": "string", "osArchitecture": "string",
+    "manufacturer": "string", "model": "string", "cpu": "object", "cpuPercent": "percent", "memory": "object", "memoryPercent": "percent",
+    "totalMemoryBytes": "number", "usedMemoryBytes": "number", "freeMemoryBytes": "number", "disks": "array", "diskPercent": "percent",
+    "diskFreeBytes": "number", "uptime": "object", "uptimeSeconds": "number", "lastBootTime": "date", "antivirus": "object",
+    "firewall": "object", "network": "object", "security": "object", "systemHealth": "object", "ups": "object", "battery": "object",
     "heartbeat": "object", "listeningPorts": "array", "agentVersion": "string",
 }
 
@@ -34,6 +36,11 @@ DATE_KEYS = {"collectedAt", "updatedAt", "lastUpdated", "lastBootTime"}
 def valid_heartbeat(body):
     if not isinstance(body, dict) or not isinstance(body.get("hostname"), str):
         return False
+    platform = body.get("platform")
+    if platform is not None:
+        normalized = str(platform).strip().lower()
+        if normalized not in ALLOWED_PLATFORMS:
+            return False
     for field, kind in HEARTBEAT_FIELDS.items():
         if field not in body:
             continue
@@ -122,6 +129,47 @@ class SystemsView(APIView):
             return Response({"message": "Unable to load systems"}, status=503)
 
 
+class PlatformSummaryView(APIView):
+    def get(self, request):
+        try:
+            systems = list_systems()
+        except Exception as error:
+            log_failure(logger, "Platform summary query failed", error)
+            return Response({"message": "Unable to load platform summary"}, status=503)
+
+        summary = {
+            "windows": {"total": 0, "online": 0, "offline": 0, "warning": 0, "critical": 0},
+            "linux": {"total": 0, "online": 0, "offline": 0, "warning": 0, "critical": 0},
+            "macos": {"total": 0, "online": 0, "offline": 0, "warning": 0, "critical": 0},
+        }
+
+        for system in systems:
+            platform = str((system or {}).get("platform") or "windows").strip().lower()
+            if platform.startswith("win"):
+                key = "windows"
+            elif platform.startswith("lin"):
+                key = "linux"
+            elif platform.startswith("mac") or platform == "darwin":
+                key = "macos"
+            else:
+                key = "windows"
+
+            stats = summary.setdefault(key, {"total": 0, "online": 0, "offline": 0, "warning": 0, "critical": 0})
+            stats["total"] += 1
+
+            state = str((system or {}).get("status") or "offline").lower()
+            if state in {"online", "healthy"}:
+                stats["online"] += 1
+            elif state == "warning":
+                stats["warning"] += 1
+            elif state == "critical":
+                stats["critical"] += 1
+            else:
+                stats["offline"] += 1
+
+        return Response(json_value(summary))
+
+
 class SystemDetailView(APIView):
     def get(self, request, system_id):
         try:
@@ -149,6 +197,47 @@ class SystemPortsView(APIView):
         return Response(json_value((system or {}).get("listeningPorts") or []))
 
 
+def _normalize_payload(payload):
+    if not isinstance(payload, dict):
+        return payload
+    platform = payload.get("platform")
+    if isinstance(platform, str):
+        payload["platform"] = platform.strip().lower()
+
+    if payload.get("cpu") and payload.get("cpuPercent") is None:
+        cpu = payload["cpu"]
+        if isinstance(cpu, dict):
+            payload["cpuPercent"] = cpu.get("usagePercent", cpu.get("utilizationPercent", cpu.get("percent")))
+    if payload.get("memory") and payload.get("memoryPercent") is None:
+        memory = payload["memory"]
+        if isinstance(memory, dict):
+            payload["memoryPercent"] = memory.get("usedPercent", memory.get("usagePercent", memory.get("percent")))
+    if payload.get("disks") and payload.get("diskPercent") is None:
+        discs = payload["disks"]
+        percentages = []
+        if isinstance(discs, list):
+            for item in discs:
+                if isinstance(item, dict):
+                    value = item.get("usedPercent", item.get("usagePercent", item.get("percent")))
+                    if isinstance(value, (int, float)) and math.isfinite(value):
+                        percentages.append(float(value))
+        if percentages:
+            payload["diskPercent"] = round(sum(percentages) / len(percentages), 2)
+    if payload.get("uptime") and payload.get("uptimeSeconds") is None:
+        uptime = payload["uptime"]
+        if isinstance(uptime, dict):
+            payload["uptimeSeconds"] = uptime.get("seconds") or uptime.get("uptimeSeconds")
+    if payload.get("security") and payload.get("antivirus") is None:
+        payload["antivirus"] = payload["security"].get("antivirus") or payload["security"]
+    if payload.get("firewall") is None and payload.get("security") and isinstance(payload["security"], dict):
+        payload["firewall"] = payload["security"].get("firewall")
+    if not payload.get("ip"):
+        payload["ip"] = payload.get("ipAddress")
+    if not payload.get("platform"):
+        payload["platform"] = "windows"
+    return payload
+
+
 class HeartbeatView(APIView):
     authentication_classes = [AgentKeyAuthentication]
     permission_classes = [IsAgent]
@@ -157,9 +246,18 @@ class HeartbeatView(APIView):
         body = request.data if isinstance(request.data, dict) else {}
         if not valid_heartbeat(body):
             return Response({"message": "Invalid heartbeat payload"}, status=400)
-        payload = {key: body[key] for key in HEARTBEAT_FIELDS if key in body}
+        payload = {key: body.get(key) for key in HEARTBEAT_FIELDS}
+        payload = _normalize_payload(payload)
+        if payload.get("platform") not in ALLOWED_PLATFORMS:
+            return Response({"message": "Invalid heartbeat payload"}, status=400)
+        operating_system = ((payload.get("systemHealth") or {}).get("operatingSystem") or {})
+        payload["os"] = payload.get("os") or operating_system.get("caption") or operating_system.get("name")
+        payload["osVersion"] = payload.get("osVersion") or operating_system.get("version")
+        payload["osBuildNumber"] = payload.get("osBuildNumber") or operating_system.get("buildNumber")
+        payload["osArchitecture"] = payload.get("osArchitecture") or operating_system.get("architecture")
         if payload.get("lastBootTime"):
-            payload["lastBootTime"] = datetime.fromisoformat(payload["lastBootTime"].replace("Z", "+00:00"))
+            boot_time = datetime.fromisoformat(payload["lastBootTime"].replace("Z", "+00:00"))
+            payload["lastBootTime"] = boot_time.replace(tzinfo=timezone.utc) if boot_time.tzinfo is None else boot_time.astimezone(timezone.utc)
         system = request.user.system
         try:
             system = update_heartbeat(system, payload)
@@ -167,7 +265,7 @@ class HeartbeatView(APIView):
             log_failure(logger, "Heartbeat could not be stored", error)
             return Response({"message": "Unable to store heartbeat"}, status=503)
         settings_data = get_settings()
-        unexpected = [port for port in system.get("listeningPorts", []) if _port_number(port.get("port")) not in settings_data.get("allowedPorts", [])]
+        unexpected = [port for port in (system.get("listeningPorts") or []) if _port_number(port.get("port")) not in settings_data.get("allowedPorts", [])]
         if unexpected:
             alert = {"system": system.get("hostname"), "type": "Unexpected listening port", "severity": "warning", "message": f"Port {unexpected[0]['port']} is not in the allowed list.", "status": "open", "createdAt": datetime.now(timezone.utc)}
             if settings.DEMO_MODE:

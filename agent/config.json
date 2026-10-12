@@ -1,6 +1,12 @@
 {
-  "serverUrl": "https://monitoring.example.com",
+  "serverUrl": "http://192.168.8.63:8000",
   "apiKey": "replace-with-device-token",
   "intervalSeconds": 30,
-  "requiredDestinations": [{ "name": "Monitoring Server", "host": "monitoring.example.com", "port": 443 }]
+  "requiredDestinations": [
+    {
+      "name": "Monitoring Server",
+      "host": "192.168.8.63",
+      "port": 8000
+    }
+  ]
 }

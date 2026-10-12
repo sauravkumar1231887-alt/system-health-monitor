@@ -26,14 +26,15 @@ cp .env.example .env
 Set a private `DJANGO_SECRET_KEY`, `DJANGO_DEBUG=True`, and `DEMO_MODE=true` to exercise
 the existing demo accounts/fixtures without Mongo. If `JWT_SECRET` is not
 provided in demo mode, Django uses the local `development-secret` default.
-Run Django on port 8000:
+Run Django on port 8000, listening on all network interfaces for LAN clients:
 
 ```bash
-.venv/bin/python manage.py runserver 127.0.0.1:8000
+.venv/bin/python manage.py runserver 0.0.0.0:8000
 ```
 
-The React app defaults to Django and can override its API URL with
-`client/.env.local`, for example `VITE_API_URL=http://127.0.0.1:8000/api`.
+The React app API URL can be set in `client/.env.local`, for example
+`VITE_API_URL=http://192.168.8.63:8000/api` for LAN access or
+`VITE_API_URL=http://127.0.0.1:8000/api` for local-only development.
 Start it separately with `npm run dev --prefix client`.
 
 ## Live Monitoring
